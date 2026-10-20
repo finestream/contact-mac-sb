@@ -1,0 +1,43 @@
+BEGIN:VCARD
+VERSION:3.0
+N:Doe;John;;;
+FN:John Doe
+ORG:Acme AG;Sales
+TITLE:Head of Sales
+UID:11111111-1111-1111-1111-111111111111
+item1.EMAIL;type=INTERNET;type=pref:john.doe@acme.ch
+item1.X-ABLabel:_$!<Work>!$_
+item2.EMAIL;type=INTERNET:jdoe@bluewin.ch
+item2.X-ABLabel:_$!<Home>!$_
+TEL;type=CELL;type=pref:+41 79 123 45 67
+item3.ADR;type=WORK;type=pref:;;Bahnhofstrasse 1;Zürich;ZH;8001;Switzerland
+item3.X-ABLabel:_$!<Work>!$_
+URL;type=pref:https://acme.ch
+item4.X-ABRELATEDNAMES:Jane Doe
+item4.X-ABLabel:_$!<Spouse>!$_
+NOTE:Met at Swiss Data Forum 2025.\nWants a demo in Q4.
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+N:Doe;Jane;;;
+FN:Jane Doe
+ORG:Newco Systems SA
+UID:22222222-2222-2222-2222-222222222222
+EMAIL;type=INTERNET:jane@newco.ch
+item1.X-ABRELATEDNAMES:John Doe
+item1.X-ABLabel:_$!<Spouse>!$_
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+N:Meier;Anna;;;
+FN:Anna Meier
+ORG:Post
+UID:33333333-3333-3333-3333-333333333333
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+N:Meier;Anna;;;
+FN:Anna Meier
+ORG:Migros
+UID:44444444-4444-4444-4444-444444444444
+END:VCARD
