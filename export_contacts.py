@@ -15,7 +15,7 @@ Usage
 -----
     python3 export_contacts.py --localspace ~/notes/MySpace \\
         [--person Contacts/People] [--company Contacts/Companies] \\
-        [--dry-run] [--limit N]
+        [--dry-run] [--prune]
 
 Files are written to:
     <localspace>/<person>/<Name>.md
@@ -31,6 +31,8 @@ See README.md in this repo for the full field reference and design notes.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import subprocess
 import sys
@@ -39,27 +41,24 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
+# Separators the AppleScript puts between vCards, and between the vCard
+# section and the id section, of the single string it returns.
 VCARD_SEP = "\n===VCARD-SEP===\n"
 IDS_MARKER = "\n===IDS-SECTION===\n"
 
 # --------------------------------------------------------------------------
 # 1. Extraction: pull raw vCards (+ local Contacts.app ids) out of Contacts.app
 #
-# Everything is returned on stdout via `return` — earlier versions of this
-# script wrote to temp files with AppleScript's `open for access`, but that
-# hits macOS's file-system sandboxing for the process driving osascript
-# ("Can't get eof of vcardFile. Access not allowed. (-1723)") well before
-# Contacts' own Automation permission even comes into play. Passing the
-# whole export back as a string sidesteps that: Contacts is the only thing
-# that needs a permission grant.
+# Everything comes back as the script's return value on stdout. Earlier
+# versions had AppleScript write temp files with `open for access`, which
+# fails with "Access not allowed (-1723)" for the process driving osascript,
+# before Contacts' own Automation permission even comes into play.
 # --------------------------------------------------------------------------
 
-# `log` statements write to stderr immediately (unbuffered, one line per
-# call), so a progress line logged every ~5% of the way through the repeat
-# loop lets Python report progress while osascript is still running, without
-# needing anything fancier than reading stderr as it arrives.
+# `log` writes one line to stderr immediately, so logging a PROGRESS line
+# every ~5% lets Python report progress while osascript is still running.
 APPLESCRIPT_TEMPLATE = '''
 tell application "Contacts"
     set thePeople to every person
@@ -102,45 +101,49 @@ PROGRESS_RE = re.compile(r"^PROGRESS (\d+)/(\d+)$")
 
 
 def extract_from_contacts_app(verbose: bool = False) -> Tuple[str, List[str]]:
-    """Run the AppleScript export and return (raw_vcard_blob, ids_in_order).
-
-    Streams stderr while osascript runs so progress log lines (see above)
-    can be reported as they arrive, rather than only after the whole export
-    finishes.
-    """
+    """Run the AppleScript export and return (raw_vcard_blob, ids_in_order)."""
     script = APPLESCRIPT_TEMPLATE % {
         "sep": VCARD_SEP.replace("\n", "\\n"),
         "ids_marker": IDS_MARKER.replace("\n", "\\n"),
     }
-    try:
-        proc = subprocess.Popen(
-            ["osascript", "-e", script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-    except FileNotFoundError:
-        sys.exit("osascript not found — this script must run on macOS.")
+    # stdout goes to a temp file, not a pipe: the result (often megabytes) is
+    # written only at the very end, while we're still reading stderr for
+    # progress. With a pipe, osascript blocks once ~64 KB are unread and never
+    # exits, so stderr never closes: a deadlock. The file is opened by Python;
+    # AppleScript itself writes nothing (see the -1723 note above).
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as out:
+        try:
+            proc = subprocess.Popen(
+                ["osascript", "-e", script],
+                stdout=out,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            sys.exit("osascript not found — this script must run on macOS.")
 
-    stderr_lines: List[str] = []
-    try:
-        for raw_line in proc.stderr:
-            line = raw_line.rstrip("\n")
-            stderr_lines.append(line)
-            m = PROGRESS_RE.match(line)
-            if m:
-                done, total = int(m.group(1)), int(m.group(2))
-                pct = int(done * 100 / total) if total else 100
-                print(f"  ... {done}/{total} contacts read ({pct}%)", flush=True)
-            elif verbose and line.strip():
-                print(f"[osascript] {line}", flush=True)
-    except KeyboardInterrupt:
-        proc.kill()
-        raise
+        # Stream stderr line by line while osascript runs (do not switch to
+        # subprocess.run(capture_output=True): progress would only show at the end).
+        stderr_lines: List[str] = []
+        try:
+            for raw_line in proc.stderr:
+                line = raw_line.rstrip("\n")
+                stderr_lines.append(line)
+                m = PROGRESS_RE.match(line)
+                if m:
+                    done, total = int(m.group(1)), int(m.group(2))
+                    pct = int(done * 100 / total) if total else 100
+                    print(f"  ... {done}/{total} contacts read ({pct}%)", flush=True)
+                elif verbose and line.strip():
+                    print(f"[osascript] {line}", flush=True)
+        except KeyboardInterrupt:
+            proc.kill()
+            raise
 
-    stdout_data = proc.stdout.read()
-    returncode = proc.wait(timeout=1800)
+        returncode = proc.wait()
+        out.seek(0)
+        stdout_data = out.read()
 
     if returncode != 0:
         sys.exit(
@@ -157,123 +160,114 @@ def extract_from_contacts_app(verbose: bool = False) -> Tuple[str, List[str]]:
             "First 500 chars:\n" + stdout_data[:500]
         )
     vcard_blob, _, id_blob = stdout_data.partition(IDS_MARKER)
-    ids = id_blob.splitlines()
-    return vcard_blob, ids
+    return vcard_blob, id_blob.splitlines()
 
 
 # --------------------------------------------------------------------------
 # 2. vCard parsing (minimal, dependency-free; tuned for Apple's 3.0 export)
 # --------------------------------------------------------------------------
 
-def unfold_lines(text: str) -> List[str]:
-    """RFC 6350 line unfolding: a line starting with space/tab continues the
-    previous line."""
-    raw_lines = text.replace("\r\n", "\n").split("\n")
-    lines: List[str] = []
-    for raw in raw_lines:
-        if raw.startswith(" ") or raw.startswith("\t"):
-            if lines:
-                lines[-1] += raw[1:]
-            continue
-        lines.append(raw)
-    return lines
-
-
-def unescape_value(value: str) -> str:
-    out = []
-    i = 0
-    while i < len(value):
-        c = value[i]
-        if c == "\\" and i + 1 < len(value):
-            nxt = value[i + 1]
-            if nxt in ("n", "N"):
-                out.append("\n")
-            elif nxt in (",", ";", "\\"):
-                out.append(nxt)
-            else:
-                out.append(nxt)
-            i += 2
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out)
-
-
-@dataclass
-class VLine:
-    group: Optional[str]
-    name: str
-    params: Dict[str, List[str]]
-    value: str
-
-
-def parse_line(line: str) -> Optional[VLine]:
-    if not line or ":" not in line:
-        return None
-    key_part, _, value = line.partition(":")
-    group = None
-    if "." in key_part:
-        maybe_group, _, rest = key_part.partition(".")
-        # A "group" is a bare token like "item1"; guard against ORG-style
-        # names that happen to contain a dot (rare, but be defensive).
-        if re.fullmatch(r"[A-Za-z0-9_-]+", maybe_group):
-            group = maybe_group
-            key_part = rest
-    parts = key_part.split(";")
-    name = parts[0].strip().upper()
-    params: Dict[str, List[str]] = {}
-    for p in parts[1:]:
-        if "=" in p:
-            pk, _, pv = p.partition("=")
-            params.setdefault(pk.strip().upper(), []).append(pv.strip().strip('"'))
-        else:
-            # bare TYPE shorthand, e.g. ";HOME"
-            params.setdefault("TYPE", []).append(p.strip())
-    return VLine(group=group, name=name, params=params, value=value)
-
-
 def split_vcards(blob: str) -> List[str]:
+    """Split the export into single vCards. A plain .vcf file (--vcf) has no
+    VCARD_SEP, so fall back to splitting before each BEGIN:VCARD."""
     if VCARD_SEP in blob:
         chunks = blob.split(VCARD_SEP)
     else:
-        # Fallback for plain concatenated .vcf files (e.g. --vcf testing input)
-        # that don't carry our extraction separator: split on each BEGIN:VCARD.
         chunks = re.split(r"(?=BEGIN:VCARD)", blob)
     return [c.strip() for c in chunks if "BEGIN:VCARD" in c]
 
 
+def unfold_lines(text: str) -> List[str]:
+    """RFC 6350 line unfolding: a line starting with space/tab continues the
+    previous line."""
+    lines: List[str] = []
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        if raw[:1] in (" ", "\t") and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    return lines
+
+
+def normalize_ws(s: str) -> str:
+    """Collapse runs of whitespace (incl. newlines) to one space, and trim."""
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def unescape_value(value: str) -> str:
+    """Undo vCard escaping: \\n becomes a newline, \\X becomes X."""
+    return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) in "nN" else m.group(1), value)
+
+
+def split_components(value: str) -> List[str]:
+    """Split a structured value (N, ORG, ADR) on unescaped ';' and unescape
+    each part. Escape pairs are matched left to right, so 'a\\;b' is one
+    component ('a;b') and 'a\\\\;b' is two ('a\\' and 'b')."""
+    tokens = re.findall(r"\\.|;|[^\\;]+|\\", value)   # escape pair, separator, text, lone '\'
+    parts = [""]
+    for tok in tokens:
+        if tok == ";":
+            parts.append("")
+        else:
+            parts[-1] += tok
+    return [unescape_value(p) for p in parts]
+
+
+@dataclass
+class VLine:
+    """One content line, e.g. `item1.EMAIL;type=INTERNET:john@acme.ch`."""
+    group: Optional[str]          # "item1": Apple ties a field to its X-ABLabel this way
+    name: str                     # "EMAIL", upper-cased
+    params: Dict[str, List[str]]  # {"TYPE": ["INTERNET"]}, keys upper-cased
+    value: str                    # raw value, still escaped
+
+
+def parse_line(line: str) -> Optional[VLine]:
+    if ":" not in line:
+        return None
+    key_part, _, value = line.partition(":")
+    group = None
+    maybe_group, dot, rest = key_part.partition(".")
+    # Only a bare token like "item1" is a group; a dot inside a parameter
+    # value is not.
+    if dot and re.fullmatch(r"[A-Za-z0-9_-]+", maybe_group):
+        group, key_part = maybe_group, rest
+    name, *raw_params = key_part.split(";")
+    params: Dict[str, List[str]] = {}
+    for p in raw_params:
+        if "=" in p:
+            pk, _, pv = p.partition("=")
+            params.setdefault(pk.strip().upper(), []).append(pv.strip().strip('"'))
+        else:
+            # vCard 2.1-style bare TYPE, e.g. ";HOME"
+            params.setdefault("TYPE", []).append(p.strip())
+    return VLine(group=group, name=name.strip().upper(), params=params, value=value)
+
+
 AB_LABEL_RE = re.compile(r"_\$!<(.+?)>!\$_")
 
-
-def clean_label(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
-    m = AB_LABEL_RE.match(raw.strip())
-    if m:
-        return m.group(1)
-    return raw.strip().strip("_")
-
-
-# Generic vCard TYPE tokens that don't carry meaningful label information —
-# every EMAIL/TEL in the world has one of these, so an accompanying
-# X-ABLabel (or a more specific TYPE) is preferred when available.
+# TYPE tokens that say nothing useful about a field (nearly every EMAIL/TEL
+# has one), so a more specific TYPE or an X-ABLabel wins over them.
 GENERIC_TYPE_TOKENS = {"PREF", "INTERNET", "VOICE"}
 
 
-def label_for(vlines_by_group: Dict[str, List[VLine]], vline: VLine, params_key="TYPE") -> Optional[str]:
-    """Prefer a sibling X-ABLabel in the same item group (Apple's
-    grouped-label convention, used for Home/Work/custom labels); fall back to
-    a specific TYPE param; then any TYPE param; then None."""
-    if vline.group:
-        for sib in vlines_by_group.get(vline.group, []):
-            if sib.name == "X-ABLABEL":
-                return clean_label(sib.value)
-    types = vline.params.get(params_key, [])
+def clean_label(raw: str) -> str:
+    """Apple's built-in labels look like `_$!<Work>!$_`; return `Work`.
+    Custom labels are stored verbatim."""
+    m = AB_LABEL_RE.match(raw.strip())
+    return m.group(1) if m else raw.strip().strip("_")
+
+
+def label_for(by_group: Dict[str, List[VLine]], vline: VLine) -> Optional[str]:
+    """Label of a field: the X-ABLabel in its item group if there is one,
+    else the first specific TYPE, else the first TYPE, else None."""
+    for sib in by_group.get(vline.group or "", []):
+        if sib.name == "X-ABLABEL":
+            return clean_label(sib.value)
+    types = vline.params.get("TYPE", [])
     specific = [t for t in types if t.upper() not in GENERIC_TYPE_TOKENS]
-    if specific:
-        return clean_label(specific[0])
-    if types:
-        return clean_label(types[0])
+    if specific or types:
+        return clean_label((specific or types)[0])
     return None
 
 
@@ -292,14 +286,20 @@ class Contact:
     department: str = ""
     job_title: str = ""
     birthday: str = ""
-    emails: List[Tuple[str, str]] = field(default_factory=list)     # (label, value)
+    # Multi-valued fields are (label, value) pairs; relations are (label, name).
+    emails: List[Tuple[str, str]] = field(default_factory=list)
     phones: List[Tuple[str, str]] = field(default_factory=list)
     addresses: List[Tuple[str, str]] = field(default_factory=list)
     urls: List[Tuple[str, str]] = field(default_factory=list)
     social: List[Tuple[str, str]] = field(default_factory=list)
     im: List[Tuple[str, str]] = field(default_factory=list)
-    relations: List[Tuple[str, str]] = field(default_factory=list)  # (label, name)
+    relations: List[Tuple[str, str]] = field(default_factory=list)
     notes: str = ""
+
+    @property
+    def key(self) -> str:
+        """Stable identity: the vCard UID, else the Contacts.app id."""
+        return self.uid or self.apple_id
 
 
 def parse_contact(raw: str, apple_id: str = "") -> Contact:
@@ -312,27 +312,25 @@ def parse_contact(raw: str, apple_id: str = "") -> Contact:
             by_group.setdefault(l.group, []).append(l)
 
     c = Contact(apple_id=apple_id)
-
     for l in lines:
         name = l.name
         val = unescape_value(l.value)
+        label = label_for(by_group, l)
 
         if name == "UID":
             c.uid = val
         elif name == "FN":
             c.full_name = val
         elif name == "N":
-            parts = [unescape_value(p) for p in l.value.split(";")]
-            parts += [""] * (5 - len(parts))
+            # N: Family; Given; Additional; Prefix; Suffix
+            parts = split_components(l.value) + [""] * 5
             c.last_name, c.first_name, c.middle_name, c.name_prefix, c.name_suffix = parts[:5]
         elif name == "NICKNAME":
             c.nickname = val
         elif name == "ORG":
-            parts = [unescape_value(p) for p in l.value.split(";") if p != ""]
-            if parts:
-                c.organization = normalize_ws(parts[0])
-            if len(parts) > 1:
-                c.department = normalize_ws(parts[1])
+            # ORG: Organization; Unit
+            parts = split_components(l.value) + [""] * 2
+            c.organization, c.department = normalize_ws(parts[0]), normalize_ws(parts[1])
         elif name == "TITLE":
             c.job_title = val
         elif name == "BDAY":
@@ -340,68 +338,67 @@ def parse_contact(raw: str, apple_id: str = "") -> Contact:
         elif name == "NOTE":
             c.notes = val
         elif name == "EMAIL":
-            c.emails.append((label_for(by_group, l) or "other", val))
+            c.emails.append((label or "other", val))
         elif name == "TEL":
-            c.phones.append((label_for(by_group, l) or "other", val))
+            c.phones.append((label or "other", val))
         elif name == "ADR":
-            comps = [unescape_value(p) for p in l.value.split(";")]
-            comps += [""] * (7 - len(comps))
             # ADR: PO Box; Extended; Street; City; Region; PostalCode; Country
-            _, _, street, city, region, postal, country = comps[:7]
+            _, _, street, city, region, postal, country = (split_components(l.value) + [""] * 7)[:7]
             addr_bits = [b for b in (street, f"{postal} {city}".strip(), region, country) if b.strip()]
-            c.addresses.append((label_for(by_group, l) or "other", ", ".join(addr_bits)))
+            c.addresses.append((label or "other", ", ".join(addr_bits)))
         elif name == "URL":
-            c.urls.append((label_for(by_group, l) or "other", val))
-        elif name in ("X-SOCIALPROFILE",):
-            service = None
-            if "TYPE" in l.params:
-                service = clean_label(l.params["TYPE"][0])
-            c.social.append((service or label_for(by_group, l) or "other", val))
-        elif name in ("IMPP",):
-            proto = val.split(":", 1)[0] if ":" in val else "im"
-            c.im.append((proto, val.split(":", 1)[-1]))
-        elif name == "X-ABRELATEDNAMES":
-            lbl = None
-            if l.group:
-                for sib in by_group.get(l.group, []):
-                    if sib.name == "X-ABLABEL":
-                        lbl = clean_label(sib.value)
-            c.relations.append((lbl or "related", val))
-        elif name == "RELATED":  # vCard 4.0 form, just in case
-            lbl = clean_label(l.params.get("TYPE", [None])[0]) if l.params.get("TYPE") else None
-            c.relations.append((lbl or "related", val))
+            c.urls.append((label or "other", val))
+        elif name == "X-SOCIALPROFILE":
+            # The service ("twitter", "linkedin") is the TYPE, even if an
+            # X-ABLabel exists.
+            types = l.params.get("TYPE")
+            c.social.append(((clean_label(types[0]) if types else label) or "other", val))
+        elif name == "IMPP":
+            # "xmpp:jane@example.com" -> ("xmpp", "jane@example.com")
+            proto, sep, handle = val.partition(":")
+            c.im.append((proto, handle) if sep else ("im", val))
+        elif name in ("X-ABRELATEDNAMES", "RELATED"):  # RELATED: vCard 4.0 form
+            c.relations.append((label or "related", val))
 
     if not c.full_name:
         c.full_name = normalize_ws(f"{c.first_name} {c.last_name}") or c.nickname or "Unnamed Contact"
-
     return c
-
-
-def normalize_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
 
 
 # --------------------------------------------------------------------------
 # 3. Filenames, slugs, wikilinks
 # --------------------------------------------------------------------------
 
-INVALID_FILENAME_CHARS = re.compile(r'[\/\\:\*\?"<>\|\x00-\x1f]')
+# Replaced by '-' in filenames. Two sources:
+# - file system: / \ : * ? " < > | and control characters
+# - SilverBullet page names (plug-api/lib/ref.ts, `refRegex`): @ # $ start a
+#   position, header or anchor in a link; [[ and ]] would break the wikilink
+INVALID_FILENAME_CHARS = re.compile(r'[\/\\:\*\?"<>\|@#\$\x00-\x1f]|\[\[|\]\]')
 
 
 def sanitize_filename(name: str) -> str:
-    name = normalize_ws(name)
-    name = INVALID_FILENAME_CHARS.sub("-", name)
-    name = name.strip(" .")
+    """Display name -> filename stem that is also a valid SilverBullet page
+    name, e.g. 'Newco S.A' -> 'Newco S-A'."""
+    name = INVALID_FILENAME_CHARS.sub("-", normalize_ws(name))
+    # A leading '.' would be a hidden file, a leading '^' a SilverBullet
+    # meta link; trailing dots and spaces are trouble on most file systems.
+    name = re.sub(r"^[\s.^]+|[\s.]+$", "", name)
+    # A name ending in '.<letters/digits>' ("example.com") would be taken by
+    # SilverBullet as a document with that extension, not a page.
+    name = re.sub(r"\.(?=[A-Za-z0-9]+$)", "-", name)
     return name or "Unnamed"
 
 
 def slugify(name: str) -> str:
+    """'Müller & Co. AG' -> 'muller-co-ag'."""
     n = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
     n = re.sub(r"[^a-zA-Z0-9]+", "-", n).strip("-").lower()
     return n or "x"
 
 
 def wikilink(dir_param: str, stem: str) -> str:
+    # dir_param is the --person/--company value as given, not the absolute
+    # path, because links are relative to the space root.
     return f"[[{dir_param}/{stem}.md]]"
 
 
@@ -409,41 +406,35 @@ def wikilink(dir_param: str, stem: str) -> str:
 # 4. YAML frontmatter (hand-rolled, no PyYAML dependency)
 # --------------------------------------------------------------------------
 
+# A plain YAML scalar can't start with an indicator character, contain
+# ": " or " #", or have surrounding spaces; such values get double quotes.
+YAML_NEEDS_QUOTES = re.compile(r'^[\s\-?:,\[\]{}#&*!|>\'"%@`]|:\s|\s#|\s$')
+
+
 def yaml_scalar(value: str) -> str:
     if value == "":
         return '""'
-    needs_quote = bool(re.search(r'^[\s\-?:,\[\]{}#&*!|>\'"%@`]|:\s|\s#|\n', value)) or value.strip() != value
     if "\n" in value:
-        # literal block scalar
-        indented = "\n".join("  " + line for line in value.split("\n"))
-        return "|\n" + indented
-    if needs_quote or value.lower() in ("true", "false", "null", "~"):
+        # Multi-line text (notes): literal block scalar, kept verbatim.
+        return "|\n" + "\n".join("  " + line for line in value.split("\n"))
+    if YAML_NEEDS_QUOTES.search(value) or value.lower() in ("true", "false", "null", "~"):
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return value
 
 
-def yaml_list(items: List[str]) -> str:
-    if not items:
-        return "[]"
-    return "\n" + "\n".join(f"  - {yaml_scalar(i)}" for i in items)
-
-
 def build_frontmatter(fields: List[Tuple[str, object]]) -> str:
+    """Render (key, value) pairs; a value is a string or a list of strings."""
     lines = ["---"]
     for key, value in fields:
         if isinstance(value, list):
-            if not value:
+            if value:
+                lines.append(f"{key}:")
+                lines.extend(f"  - {yaml_scalar(item)}" for item in value)
+            else:
                 lines.append(f"{key}: []")
-            else:
-                lines.append(f"{key}:{yaml_list(value)}")
         else:
-            sval = str(value)
-            rendered = yaml_scalar(sval)
-            if rendered.startswith("|"):
-                lines.append(f"{key}: {rendered}")
-            else:
-                lines.append(f"{key}: {rendered}")
+            lines.append(f"{key}: {yaml_scalar(str(value))}")
     lines.append("---")
     return "\n".join(lines) + "\n"
 
@@ -462,17 +453,18 @@ def render_company_page(name: str, people_links: List[str], now_iso: str) -> str
     ])
     body_lines = [f"# {name}", ""]
     if people_links:
-        body_lines.append("## People")
-        body_lines.append("")
-        for link in sorted(people_links):
-            body_lines.append(f"- {link}")
+        body_lines += ["## People", ""]
+        body_lines += [f"- {link}" for link in sorted(people_links)]
         body_lines.append("")
     return fm + "\n" + "\n".join(body_lines)
 
 
-def render_person_page(c: Contact, company_link: Optional[str], relation_links: List[str], now_iso: str) -> str:
-    fields: List[Tuple[str, object]] = [
-        ("uid", c.uid or c.apple_id or ""),
+def render_person_page(c: Contact, company_link: str, relation_links: List[str], now_iso: str) -> str:
+    def labelled(pairs: List[Tuple[str, str]]) -> List[str]:
+        return [f"{lbl}:{val}" for lbl, val in pairs]
+
+    fm = build_frontmatter([
+        ("uid", c.key),
         ("appleId", c.apple_id),
         ("type", "person"),
         ("fullName", c.full_name),
@@ -485,43 +477,202 @@ def render_person_page(c: Contact, company_link: Optional[str], relation_links: 
         ("organization", c.organization),
         ("department", c.department),
         ("jobTitle", c.job_title),
-        ("company", company_link or ""),
-        ("emails", [f"{lbl}:{val}" for lbl, val in c.emails]),
-        ("phones", [f"{lbl}:{val}" for lbl, val in c.phones]),
-        ("addresses", [f"{lbl}:{val}" for lbl, val in c.addresses]),
-        ("urls", [f"{lbl}:{val}" for lbl, val in c.urls]),
-        ("social", [f"{lbl}:{val}" for lbl, val in c.social]),
-        ("im", [f"{lbl}:{val}" for lbl, val in c.im]),
+        ("company", company_link),
+        ("emails", labelled(c.emails)),
+        ("phones", labelled(c.phones)),
+        ("addresses", labelled(c.addresses)),
+        ("urls", labelled(c.urls)),
+        ("social", labelled(c.social)),
+        ("im", labelled(c.im)),
         ("birthday", c.birthday),
         ("relations", relation_links),
         ("notes", c.notes),
         ("source", "apple-contacts"),
         ("exportedAt", now_iso),
-    ]
-    fm = build_frontmatter(fields)
+    ])
     body_lines = [f"# {c.full_name}", ""]
-    if c.job_title or c.organization:
-        line = c.job_title
-        if c.organization:
-            line = f"{line} at {company_link}" if line else f"{company_link}"
-        body_lines.append(line)
-        body_lines.append("")
+    # "Head of Sales at [[Contacts/Companies/Acme AG.md]]", or just one half.
+    tagline = " at ".join(part for part in (c.job_title, company_link) if part)
+    if tagline:
+        body_lines += [tagline, ""]
     return fm + "\n" + "\n".join(body_lines)
 
 
 # --------------------------------------------------------------------------
-# 6. Main pipeline
+# 6. Manifest: stable filenames, renames and stale files across runs
+#
+# Each output dir holds a manifest mapping a stable key (person: uid,
+# company: slug) to the filename it was written under. On the next run a
+# key keeps its old filename as long as its name hasn't changed, so clash
+# numbering ("Anna Meier 2") no longer depends on Contacts.app's return
+# order. Files whose key has disappeared are "stale": reported by default
+# and remembered in the manifest (so they keep being reported), or deleted
+# with --prune. Only files named in a manifest are ever renamed or deleted.
 # --------------------------------------------------------------------------
 
-def unique_path_for(base_dir: Path, stem: str, taken: Dict[str, int]) -> str:
-    """Return a filesystem-unique stem, appending ' N' on collision."""
-    key = stem.lower()
-    if key not in taken:
-        taken[key] = 1
-        return stem
-    taken[key] += 1
-    new_stem = f"{stem} {taken[key]}"
-    return unique_path_for(base_dir, new_stem, taken) if new_stem.lower() in taken else new_stem
+MANIFEST_NAME = ".contacts-manifest.json"
+
+
+def is_plain_md_filename(name: object) -> bool:
+    """Guard against a hand-edited manifest pointing outside its directory."""
+    return (isinstance(name, str) and name.endswith(".md") and name == Path(name).name
+            and not name.startswith("."))
+
+
+def load_manifest(directory: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Return (entries, stale), both key -> filename; empty if no manifest."""
+    path = directory / MANIFEST_NAME
+    if not path.exists():
+        return {}, {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries = dict(data.get("entries", {}))
+        stale = dict(data.get("stale", {}))
+    except (ValueError, AttributeError, TypeError) as e:
+        sys.exit(f"Cannot read {path}: {e}\nFix or remove it, then re-run.")
+    for k, f in list(entries.items()) + list(stale.items()):
+        if not is_plain_md_filename(f):
+            sys.exit(f"{path}: entry {k!r} has an invalid filename {f!r}. Fix or remove the manifest.")
+    return entries, stale
+
+
+def write_manifest(plan: DirPlan, prune: bool) -> None:
+    data = {
+        "version": 1,
+        "kind": plan.kind,
+        "entries": plan.entries,
+        # Kept stale files stay listed, so the next run reports them again.
+        "stale": {} if prune else plan.stale,
+    }
+    # Write a temp file and rename it over the old one, so an interrupted
+    # run never leaves a half-written manifest.
+    tmp = plan.directory / (MANIFEST_NAME + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, plan.directory / MANIFEST_NAME)
+
+
+def assign_stems(items: List[Tuple[Optional[str], str]], previous: Dict[str, str], reserved: Set[str]) -> List[str]:
+    """Pick a unique filename stem for each (key, base_name) item.
+
+    Pass 1: an item keeps its previous stem if that is still its base name,
+    or its base name plus a clash number. Pass 2: every other item gets the
+    base name, or the base name with ' 2', ' 3', ... on collision.
+    `reserved` stems (stale files being kept) are never handed out.
+    Comparison is case-insensitive, like the macOS file system."""
+    taken = {r.lower() for r in reserved}
+    stems: List[Optional[str]] = [None] * len(items)
+    for i, (key, base) in enumerate(items):
+        old_file = previous.get(key) if key else None
+        if not old_file:
+            continue
+        old_stem = old_file[:-len(".md")]
+        still_fits = old_stem == base or re.fullmatch(re.escape(base) + r" \d+", old_stem)
+        if still_fits and old_stem.lower() not in taken:
+            stems[i] = old_stem
+            taken.add(old_stem.lower())
+    for i, (_, base) in enumerate(items):
+        if stems[i] is not None:
+            continue
+        stem, n = base, 1
+        while stem.lower() in taken:
+            n += 1
+            stem = f"{base} {n}"
+        stems[i] = stem
+        taken.add(stem.lower())
+    return stems  # type: ignore[return-value]
+
+
+@dataclass
+class DirPlan:
+    """Everything this run will do in one output directory."""
+    directory: Path
+    kind: str                        # "person" or "company"
+    stems: List[str]                 # filename stem per item, in input order
+    renames: List[Tuple[str, str]]   # (old filename, new filename)
+    stale: Dict[str, str]            # key -> filename of existing files whose key is gone
+    entries: Dict[str, str]          # key -> filename, the new manifest entries
+
+
+def plan_dir(directory: Path, kind: str, items: List[Tuple[Optional[str], str]], prune: bool) -> DirPlan:
+    """Plan filenames, renames and stale files for (key, base_name) items.
+    Items with key None get a filename but aren't tracked in the manifest."""
+    entries, old_stale = load_manifest(directory)
+    previous = {**old_stale, **entries}   # a key that's back in Contacts gets its file back
+    current_keys = {k for k, _ in items if k}
+    # Stale entries whose file is already gone (deleted by hand) are dropped.
+    stale = {k: f for k, f in previous.items() if k not in current_keys and (directory / f).exists()}
+    # Without --prune, stale files stay on disk, so their names are taken.
+    reserved = set() if prune else {f[:-len(".md")] for f in stale.values()}
+    stems = assign_stems(items, previous, reserved)
+
+    renames: List[Tuple[str, str]] = []
+    new_entries: Dict[str, str] = {}
+    for (key, _), stem in zip(items, stems):
+        if not key:
+            continue
+        new_entries[key] = f"{stem}.md"
+        old = previous.get(key)
+        if old and old != f"{stem}.md" and (directory / old).exists():
+            renames.append((old, f"{stem}.md"))
+    return DirPlan(directory, kind, stems, renames, stale, new_entries)
+
+
+def apply_renames_and_prune(plan: DirPlan, prune: bool) -> None:
+    # Prune first: a deleted stale file's name may be reused this run.
+    if prune:
+        for f in plan.stale.values():
+            (plan.directory / f).unlink()
+    # Rename in two passes via temp names, so swapped names ("A" <-> "B")
+    # and case-only renames work.
+    temps = []
+    for i, (old, new) in enumerate(plan.renames):
+        tmp = plan.directory / f".contacts-rename-{i}.tmp"
+        os.rename(plan.directory / old, tmp)
+        temps.append((tmp, new))
+    for tmp, new in temps:
+        os.rename(tmp, plan.directory / new)
+
+
+def report_plan(label: str, plan: DirPlan, prune: bool, dry_run: bool) -> None:
+    for old, new in plan.renames:
+        print(f"  {label}: {'would rename' if dry_run else 'renamed'} {old} -> {new}")
+    if prune:
+        action = "would delete" if dry_run else "deleted"
+    else:
+        action = "stale (kept; --prune deletes)"
+    for key, f in sorted(plan.stale.items(), key=lambda kv: kv[1]):
+        print(f"  {label}: {action}: {f}  [{key}]")
+
+
+# --------------------------------------------------------------------------
+# 7. Main pipeline
+# --------------------------------------------------------------------------
+
+def link_relations(contacts: List[Contact], person_stems: List[str], person_param: str
+                   ) -> Tuple[List[List[str]], List[str]]:
+    """Return (relation entries per contact, unmatched-relation messages).
+
+    A related name becomes a wikilink only if exactly one *other* contact
+    has that full name (case- and whitespace-insensitive); otherwise it's
+    kept as plain text, so nothing is guessed."""
+    by_name: Dict[str, List[int]] = {}
+    for i, c in enumerate(contacts):
+        by_name.setdefault(normalize_ws(c.full_name).lower(), []).append(i)
+
+    all_links: List[List[str]] = []
+    unmatched: List[str] = []
+    for i, c in enumerate(contacts):
+        links = []
+        for label, rel_name in c.relations:
+            matches = [j for j in by_name.get(normalize_ws(rel_name).lower(), []) if j != i]
+            if len(matches) == 1:
+                links.append(f"{label}:{wikilink(person_param, person_stems[matches[0]])}")
+            else:
+                reason = f"{len(matches)} contacts share that name" if matches else "no contact with that name"
+                unmatched.append(f'{c.full_name} -- "{label}: {rel_name}" ({reason})')
+                links.append(f"{label}:{rel_name}")
+        all_links.append(links)
+    return all_links, unmatched
 
 
 def main() -> None:
@@ -530,102 +681,98 @@ def main() -> None:
     ap.add_argument("--person", default="Contacts/People", help="Path (under localspace) for person pages")
     ap.add_argument("--company", default="Contacts/Companies", help="Path (under localspace) for company pages")
     ap.add_argument("--dry-run", action="store_true", help="Parse and report, write nothing")
-    ap.add_argument("--limit", type=int, default=None, help="Only process the first N contacts (testing)")
+    ap.add_argument("--prune", action="store_true",
+                    help="Delete files whose contact/company no longer exists (default: only report them)")
     ap.add_argument("--vcf", type=Path, default=None, help="Read vCards from this file instead of Contacts.app (testing)")
     ap.add_argument("-v", "--verbose", action="store_true",
-                     help="Print extra detail: every raw osascript log line, and the full list of "
-                          "unmatched/ambiguous relations with reasons")
+                    help="Print extra detail: every raw osascript log line, untracked contacts, and the "
+                         "full list of unmatched/ambiguous relations with reasons")
     args = ap.parse_args()
 
     localspace = Path(args.localspace).expanduser().resolve()
     person_dir = localspace / args.person
     company_dir = localspace / args.company
+    if person_dir.resolve() == company_dir.resolve():
+        sys.exit("--person and --company must be different directories (each keeps its own manifest).")
 
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
+    # -- read and parse --
     if args.vcf:
-        blob = args.vcf.read_text(encoding="utf-8", errors="replace")
-        ids = [""] * blob.count("BEGIN:VCARD")
+        blob, ids = args.vcf.read_text(encoding="utf-8", errors="replace"), []
     else:
         print("Reading contacts from Contacts.app (this may take a while for a large address book)...")
         blob, ids = extract_from_contacts_app(verbose=args.verbose)
-
-    raw_cards = split_vcards(blob)
-    if args.limit:
-        raw_cards = raw_cards[: args.limit]
-        ids = ids[: args.limit]
-
-    contacts = [parse_contact(raw, apple_id=(ids[i] if i < len(ids) else "")) for i, raw in enumerate(raw_cards)]
+    contacts = [parse_contact(raw, apple_id=ids[i] if i < len(ids) else "")
+                for i, raw in enumerate(split_vcards(blob))]
     print(f"Parsed {len(contacts)} contacts.")
 
-    # -- companies: unique, verbatim (whitespace-normalised) ORG strings --
+    # Companies are the unique ORG strings, whitespace-normalised, otherwise
+    # verbatim ("Acme AG" and "Acme" are two companies).
     company_names = sorted({c.organization for c in contacts if c.organization})
     print(f"Found {len(company_names)} unique companies.")
 
-    company_taken: Dict[str, int] = {}
-    company_stem_by_name: Dict[str, str] = {}
+    # -- plan filenames --
+    # Companies are keyed by slug. Distinct names with the same slug
+    # ("Acme AG" / "Acme-AG") get "#2", "#3", ... in sorted-name order.
+    company_items: List[Tuple[Optional[str], str]] = []
+    slug_counts: Dict[str, int] = {}
     for name in company_names:
-        stem = unique_path_for(company_dir, sanitize_filename(name), company_taken)
-        company_stem_by_name[name] = stem
+        slug = slugify(name)
+        slug_counts[slug] = slug_counts.get(slug, 0) + 1
+        key = slug if slug_counts[slug] == 1 else f"{slug}#{slug_counts[slug]}"
+        company_items.append((key, sanitize_filename(name)))
+    company_plan = plan_dir(company_dir, "company", company_items, args.prune)
+    company_stem = dict(zip(company_names, company_plan.stems))
 
-    # -- people: unique filenames, disambiguated on full-name collision --
-    person_taken: Dict[str, int] = {}
-    person_stem_by_contact: Dict[int, str] = {}
-    for i, c in enumerate(contacts):
-        base = sanitize_filename(c.full_name)
-        stem = unique_path_for(person_dir, base, person_taken)
-        person_stem_by_contact[i] = stem
+    # People are keyed by uid. Cards without one, or repeating an earlier
+    # card's uid, still get a file but aren't tracked in the manifest.
+    person_items: List[Tuple[Optional[str], str]] = []
+    seen_keys: Set[str] = set()
+    for c in contacts:
+        key = c.key if c.key and c.key not in seen_keys else None
+        if key:
+            seen_keys.add(key)
+        elif args.verbose:
+            print(f"  Not tracked in manifest (no unique uid): {c.full_name}")
+        person_items.append((key, sanitize_filename(c.full_name)))
+    person_plan = plan_dir(person_dir, "person", person_items, args.prune)
+    person_stems = person_plan.stems
 
-    # lookup for relation matching: normalised full name -> list of indices
-    name_index: Dict[str, List[int]] = {}
-    for i, c in enumerate(contacts):
-        name_index.setdefault(normalize_ws(c.full_name).lower(), []).append(i)
-
-    # -- render + write people --
-    company_people_links: Dict[str, List[str]] = {name: [] for name in company_names}
-
-    if not args.dry_run:
-        person_dir.mkdir(parents=True, exist_ok=True)
-        company_dir.mkdir(parents=True, exist_ok=True)
-
-    unmatched_details: List[str] = []
-    for i, c in enumerate(contacts):
-        stem = person_stem_by_contact[i]
-        company_link = None
+    # -- render pages --
+    relation_links, unmatched = link_relations(contacts, person_stems, args.person)
+    company_people: Dict[str, List[str]] = {name: [] for name in company_names}
+    person_pages: Dict[str, str] = {}   # filename -> content
+    for c, stem, rels in zip(contacts, person_stems, relation_links):
+        company_link = ""
         if c.organization:
-            company_link = wikilink(args.company, company_stem_by_name[c.organization])
-            company_people_links[c.organization].append(wikilink(args.person, stem))
+            company_link = wikilink(args.company, company_stem[c.organization])
+            company_people[c.organization].append(wikilink(args.person, stem))
+        person_pages[f"{stem}.md"] = render_person_page(c, company_link, rels, now_iso)
+    company_pages = {f"{company_stem[name]}.md": render_company_page(name, company_people[name], now_iso)
+                     for name in company_names}
 
-        relation_links: List[str] = []
-        for label, rel_name in c.relations:
-            candidates = name_index.get(normalize_ws(rel_name).lower(), [])
-            candidates = [idx for idx in candidates if idx != i]
-            if len(candidates) == 1:
-                target_stem = person_stem_by_contact[candidates[0]]
-                relation_links.append(f"{label}:{wikilink(args.person, target_stem)}")
-            else:
-                reason = "no contact with that name" if not candidates else f"{len(candidates)} contacts share that name"
-                unmatched_details.append(f'{c.full_name} -- "{label}: {rel_name}" ({reason})')
-                relation_links.append(f"{label}:{rel_name}")
+    # -- write: renames/prune, then pages, then the manifest last, so an
+    # interrupted run is simply redone on the next one --
+    if not args.dry_run:
+        for plan, pages in ((person_plan, person_pages), (company_plan, company_pages)):
+            plan.directory.mkdir(parents=True, exist_ok=True)
+            apply_renames_and_prune(plan, args.prune)
+            for filename, page in pages.items():
+                (plan.directory / filename).write_text(page, encoding="utf-8")
+            write_manifest(plan, args.prune)
 
-        page = render_person_page(c, company_link, relation_links, now_iso)
-        if args.dry_run:
-            continue
-        (person_dir / f"{stem}.md").write_text(page, encoding="utf-8")
-
-    for name in company_names:
-        page = render_company_page(name, company_people_links[name], now_iso)
-        if args.dry_run:
-            continue
-        (company_dir / f"{company_stem_by_name[name]}.md").write_text(page, encoding="utf-8")
-
-    print(f"People written to:    {person_dir}")
-    print(f"Companies written to: {company_dir}")
-    if unmatched_details:
-        print(f"Note: {len(unmatched_details)} relation(s) could not be matched to exactly one contact "
+    # -- report --
+    where = "would be written to" if args.dry_run else "written to"
+    print(f"People {where}:    {person_dir}")
+    print(f"Companies {where}: {company_dir}")
+    report_plan("people", person_plan, args.prune, args.dry_run)
+    report_plan("companies", company_plan, args.prune, args.dry_run)
+    if unmatched:
+        print(f"Note: {len(unmatched)} relation(s) could not be matched to exactly one contact "
               f"and were kept as plain text instead of a link.")
         if args.verbose:
-            for line in unmatched_details:
+            for line in unmatched:
                 print(f"  - {line}")
         else:
             print("  Re-run with -v/--verbose to see each one and why.")
