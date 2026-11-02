@@ -170,3 +170,7 @@ each contact on its number.
 - Extraction can take a couple of minutes on a large (500–1000 contact)
   address book, since AppleScript talks to Contacts.app one property at a
   time per contact.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

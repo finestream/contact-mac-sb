@@ -12,7 +12,7 @@ for the user-facing field reference.
 python3 export_contacts.py --localspace /tmp/sb --vcf test_fixture.vcf -v
 
 # Real run (macOS only). Use --dry-run first, then without it:
-python3 export_contacts.py --localspace ~/Syncthing/notes/testcontacts --dry-run -v
+python3 export_contacts.py --localspace ~/notes/MySpace --dry-run -v
 ```
 
 Flags: `--localspace` (required), `--person` (default `Contacts/People`),
@@ -64,8 +64,8 @@ Internal links are written literally as `[[<person>/<Name>.md]]` and
   a pipe, osascript blocks once ~64 KB are unread and both sides hang.
   Verified: a 1 MB return hangs with a pipe, takes 0.1 s with a temp file.
 - Automation permission: if no prompt appears, macOS holds a stored denial.
-  Fix: `tccutil reset AppleEvents com.googlecode.iterm2` (use
-  `com.apple.Terminal` for Terminal.app), then re-run. Check with
+  Fix: `tccutil reset AppleEvents <bundle id of your terminal>` (for example
+  `com.apple.Terminal`, `com.googlecode.iterm2`), then re-run. Check with
   `osascript -e 'tell application "Contacts" to count every person'`.
 - `uid` (vCard UID) is the only stable identity. Never key anything on the
   filename or display name; duplicate names are normal.
@@ -84,7 +84,7 @@ Internal links are written literally as `[[<person>/<Name>.md]]` and
   keep everything below byte for byte.
 - Relation matching is exact full-name only (no fuzzy matching).
 - No photos.
-- Extraction takes minutes for ~800 contacts; this is AppleScript, not a bug.
+- Extraction takes minutes for several hundred contacts; this is AppleScript, not a bug.
 
 ## Conventions
 
@@ -96,9 +96,6 @@ Internal links are written literally as `[[<person>/<Name>.md]]` and
 
 ## Background
 
-Background lives in the claude.ai project "Import contacts in silverbullet.md":
-`contacts-overview.md` (status, known gaps, lessons such as clash naming and
-SilverBullet page-name rules) and `contact-identifiers-and-links.md`
-(`addressbook://` deep links). An earlier, heavier design (Python sidecar +
-Space Lua library, CardDAV via vdirsyncer) was abandoned in October 2026 in
-favour of this script; don't reintroduce it.
+An earlier, heavier design (Python sidecar + Space Lua library, CardDAV via
+vdirsyncer) was abandoned in October 2026 in favour of this script; don't
+reintroduce it.
